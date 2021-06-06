@@ -1,0 +1,123 @@
+#!/bin/bash
+
+set -euo pipefail
+readonly script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" &>/dev/null && pwd -P)
+cd $script_dir
+
+readonly USAGE="env PASSWORD=<password> $0 <P12_FILE>"
+readonly PASSWORD=${PASSWORD:-}
+readonly P12_FILE=${1?-$USAGE}
+
+p12_exponent() {
+    openssl pkcs12 -info -passin pass:"$PASSWORD" -in "$P12_FILE" -nodes |
+        openssl x509 -text -noout |
+        sed -n "/Exponent/s/.*x//p" |
+        tr -d ')' |
+        xargs printf '%6s' | sed 's/ /0/g' |
+        xxd -r -p |
+        openssl base64
+}
+
+p12_modulus() {
+    openssl pkcs12 -info -passin pass:"$PASSWORD" -in "$P12_FILE" -nodes |
+        openssl x509 -modulus -noout |
+        sed -n /Modulus/s/Modulus=//p |
+        xxd -r -p |
+        openssl base64
+}
+
+p12_cert_digest() {
+    openssl pkcs12 -info -passin pass:"$PASSWORD" -in "$P12_FILE" -nodes |
+        openssl x509 -inform pem -outform der |
+        openssl dgst -sha256 -binary |
+        openssl base64
+}
+
+p12_issuer_name() {
+    openssl pkcs12 -info -passin pass:"$PASSWORD" -in "$P12_FILE" -nodes |
+        openssl x509 -issuer -noout |
+        sed 's/issuer=//'
+}
+
+p12_serial() {
+    openssl pkcs12 -info -passin pass:"$PASSWORD" -in "$P12_FILE" -nodes |
+        openssl x509 -serial -noout |
+        sed 's/serial=/ibase=16;/' |
+        bc
+}
+readonly SIGNATURE_TPL=$(cat <<EOF
+<ds:Signature xmlns:ds="http://www.w3.org/2000/09/xmldsig#" Id="id-signature">
+  <ds:SignedInfo>
+    <ds:CanonicalizationMethod Algorithm="http://www.w3.org/TR/2001/REC-xml-c14n-20010315"/>
+    <ds:SignatureMethod Algorithm="http://www.w3.org/2001/04/xmldsig-more#rsa-sha256"/>
+    <ds:Reference URI="">
+      <ds:Transforms>
+        <ds:Transform Algorithm="http://www.w3.org/2000/09/xmldsig#enveloped-signature"/>
+      </ds:Transforms>
+      <ds:DigestMethod Algorithm="http://www.w3.org/2001/04/xmlenc#sha256"/>
+      <ds:DigestValue/>
+    </ds:Reference>
+    <ds:Reference URI="#id-key-info">
+      <ds:DigestMethod Algorithm="http://www.w3.org/2001/04/xmlenc#sha256"/>
+      <ds:DigestValue/>
+    </ds:Reference>
+    <ds:Reference URI="#id-signed-properties" Type="http://uri.etsi.org/01903#SignedProperties">
+      <ds:DigestMethod Algorithm="http://www.w3.org/2001/04/xmlenc#sha256"/>
+      <ds:DigestValue/>
+    </ds:Reference>
+  </ds:SignedInfo>
+  <ds:SignatureValue></ds:SignatureValue>
+  <ds:KeyInfo Id="id-key-info">
+    <ds:KeyValue>
+      <ds:RSAKeyValue>
+        <ds:Modulus>
+$(p12_modulus)
+        </ds:Modulus>
+        <ds:Exponent>$(p12_exponent)</ds:Exponent>
+      </ds:RSAKeyValue>
+    </ds:KeyValue>
+    <ds:X509Data>
+    </ds:X509Data>
+  </ds:KeyInfo>
+  <ds:Object>
+    <xades:QualifyingProperties xmlns:xades="http://uri.etsi.org/01903/v1.3.2#" Target="#id-signature">
+      <xades:SignedProperties Id="id-signed-properties">
+        <xades:SignedSignatureProperties>
+          <xades:SigningTime>2021-06-05T13:18:41.933Z</xades:SigningTime>
+          <xades:SigningCertificate>
+            <xades:Cert>
+              <xades:CertDigest>
+                <ds:DigestMethod Algorithm="http://www.w3.org/2001/04/xmlenc#sha256"/>
+                <ds:DigestValue>
+$(p12_cert_digest)
+                </ds:DigestValue>
+              </xades:CertDigest>
+              <xades:IssuerSerial>
+                <ds:X509IssuerName>$(p12_issuer_name)</ds:X509IssuerName>
+                <ds:X509SerialNumber>$(p12_serial)</ds:X509SerialNumber>
+              </xades:IssuerSerial>
+            </xades:Cert>
+          </xades:SigningCertificate>
+          <xades:SignaturePolicyIdentifier>
+            <xades:SignaturePolicyId>
+              <xades:SigPolicyId>
+                <xades:Identifier>https://signature.policy.url</xades:Identifier>
+              </xades:SigPolicyId>
+              <xades:SigPolicyHash>
+                <ds:DigestMethod Algorithm="http://www.w3.org/2001/04/xmlenc#sha256"/>
+                <ds:DigestValue>AARTQ+K/7GhpRN6Es6m4ryJAR145SS1v9dy3q+CZTSo=</ds:DigestValue>
+              </xades:SigPolicyHash>
+            </xades:SignaturePolicyId>
+          </xades:SignaturePolicyIdentifier>
+        </xades:SignedSignatureProperties>
+      </xades:SignedProperties>
+    </xades:QualifyingProperties>
+  </ds:Object>
+</ds:Signature>
+
+EOF
+)
+
+readonly SIGNMEFILE=$(mktemp)
+env SIGNATURE="$SIGNATURE_TPL" envsubst > "$SIGNMEFILE"
+xmlsec1 --sign --pkcs12 "$P12_FILE" --pwd "$PASSWORD" "$SIGNMEFILE"

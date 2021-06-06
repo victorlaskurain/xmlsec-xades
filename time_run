@@ -1,0 +1,7 @@
+#!/bin/bash
+
+set -euo pipefail
+readonly script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" &>/dev/null && pwd -P)
+cd $script_dir
+
+time env PASSWORD=794613 ./sign_xml ciudadano_act.p12 < signme.xml 2>/dev/null
